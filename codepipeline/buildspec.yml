@@ -13,7 +13,7 @@ version: 0.2
 #   TARGET (default "."), VERSION (default "latest"), DETECTORS, STRICT,
 #   RULES_REF, RULES_REPO, SARIF_FILE, JSON_FILE,
 #   RISK_SCORE_THRESHOLD (default 0), SEVERITY_THRESHOLD (default none),
-#   GITHUB_TOKEN (optional — dodges GitHub's 60 req/hr anon rate limit).
+#   GITHUB_TOKEN (optional secret — dodges GitHub's 60 req/hr anon rate limit).
 
 env:
   variables:

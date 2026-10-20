@@ -51,8 +51,10 @@ prints the readiness report, uploads `trustabl.json` / `trustabl.sarif` /
 medium-or-higher** — so the pipeline stops on unsafe agent code.
 
 > **Want report-only (don't block the pipeline)?** trustabl fails on medium+ by
-> default. To make it advisory, change the build command in your buildspec to:
-> `- bash "$CODEBUILD_SRC_DIR/scan/trustabl-scan.sh" || true`
+> default. To make the finding gate advisory while still failing the build when
+> the download or checksum check does not succeed (exit 2), change the build
+> command in your buildspec to:
+> `- bash "$CODEBUILD_SRC_DIR/scan/trustabl-scan.sh" || { code=$?; if [ "$code" -eq 2 ]; then exit 2; fi; }`
 
 ### CLI (alternative to steps 2–3)
 After vendoring (step 1), replace `<you>/<repo>` and `<acct>`:

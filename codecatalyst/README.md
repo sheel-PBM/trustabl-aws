@@ -42,8 +42,9 @@ The workflow triggers on push to `main`. CodeCatalyst → your project →
 tab (SARIF), and **fails the run on any medium-or-higher finding**.
 
 > **Report-only (don't block)?** trustabl fails on medium+ by default. To make
-> it advisory, change the workflow `Run:` line to:
-> `- Run: bash scan/trustabl-scan.sh || true`
+> the finding gate advisory while still failing the run when the download or
+> checksum check does not succeed (exit 2), change the workflow `Run:` line to:
+> `- Run: bash scan/trustabl-scan.sh || { code=$?; if [ "$code" -eq 2 ]; then exit 2; fi; }`
 
 ### CLI?
 CodeCatalyst workflows are **file-driven** — there's no separate CLI to create
