@@ -72,7 +72,7 @@ is honest about what it could not evaluate.
 |---|---|
 | `0` | No findings at or above medium |
 | `1` | Gated — findings crossed a configured threshold |
-| `2` | Scanner or I/O error, or no usable rules |
+| `2` | Scanner or I/O error, a failed download or checksum, or no usable rules |
 
 **Exit 1 is a result, not a malfunction.** Exit 2 means the scan did not complete
 and the output should not be trusted.

@@ -2,8 +2,8 @@
 # Trustabl — AWS scanner (shared by the CodePipeline buildspec and the
 # CodeCatalyst workflow).
 #
-# Downloads the upstream `trustabl` release binary (sha256-verified against the
-# release checksums.txt), scans the source, prints a colored readiness report,
+# Downloads the upstream `trustabl` release binary and refuses to run it unless
+# its sha256 matches the release checksums.txt. Scans the source, prints a report,
 # emits trustabl.json + trustabl.sarif + trustabl-summary.md + trustabl.env, and
 # gates on RISK_SCORE_THRESHOLD / SEVERITY_THRESHOLD.
 #
@@ -27,16 +27,69 @@ JSON_FILE="${JSON_FILE:-trustabl.json}"
 RISK_THRESHOLD="${RISK_SCORE_THRESHOLD:-0}"
 SEV_THRESHOLD="${SEVERITY_THRESHOLD:-none}"
 BRANCH_INPUT="${BRANCH:-}"
-[ "${DEBUG:-false}" = "true" ] && set -x
+# Turned on only after the token is stored outside the command line. xtrace
+# would otherwise print "Authorization: Bearer …" into the build log.
+DEBUG_TRACE=0
+[ "${DEBUG:-false}" = "true" ] && DEBUG_TRACE=1
 
 set -e
 # trustabl reads TRUSTABL_RULES_REPO from the env (empty = its default).
 export TRUSTABL_RULES_REPO="$RULES_REPO"
 
-# Optional GitHub auth (set GITHUB_TOKEN as a secret) to dodge the 60 req/hr
-# anonymous GitHub API limit on version lookup + download.
-AUTH=()
-[ -n "${GITHUB_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+# Optional GitHub auth. The token is written to a mode-600 curl config so it
+# is not a curl argument (where `set -x` and `ps` would show it).
+CURL_CFG=""
+DEST=""
+cleanup() {
+  # Always succeed. A failing last command here would replace the script's
+  # exit status, so a setup failure (exit 2) would be reported as exit 1.
+  if [ -n "$CURL_CFG" ]; then rm -f -- "$CURL_CFG"; fi
+  if [ -n "$DEST" ] && [ -d "$DEST" ]; then rm -rf -- "$DEST"; fi
+  return 0
+}
+trap cleanup EXIT
+
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+  case "$GITHUB_TOKEN" in
+    *[[:space:]]*|*[\"\\]*)
+      echo "Refusing GITHUB_TOKEN that contains whitespace, quotes, or backslashes." >&2
+      exit 2
+      ;;
+  esac
+  CURL_CFG=$(mktemp)
+  chmod 600 "$CURL_CFG"
+  # `set -x` / `bash -x` would print this printf, token included. Suppress it
+  # for this write only, then restore whatever tracing the caller had on.
+  case $- in *x*) xtrace_was_on=1 ;; *) xtrace_was_on=0 ;; esac
+  set +x
+  printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" > "$CURL_CFG"
+  [ "$xtrace_was_on" = "1" ] && set -x
+fi
+
+# HTTPS only, and do not let curl rewrite /../ in the release path.
+curl_gh() {
+  if [ -n "$CURL_CFG" ]; then
+    curl --config "$CURL_CFG" --proto '=https' --proto-redir '=https' --path-as-is "$@"
+  else
+    curl --proto '=https' --proto-redir '=https' --path-as-is "$@"
+  fi
+}
+
+# Replace a destination without following a symlink. `>` follows one and would
+# let a file in the workspace overwrite whatever it points at.
+stage_output() {
+  local dest="$1" dir tmp
+  dir=$(dirname -- "$dest")
+  if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+    echo "Refusing to write ${dest}: parent is missing or is a symlink." >&2
+    exit 2
+  fi
+  tmp=$(mktemp "$dir/.trustabl-write.XXXXXX")
+  cat > "$tmp"
+  mv -f -- "$tmp" "$dest"
+}
+
+[ "$DEBUG_TRACE" = "1" ] && set -x
 
 # ---- resolve branch label ----
 # CodeBuild gives refs/heads/<branch> in CODEBUILD_WEBHOOK_HEAD_REF; CodeCatalyst
@@ -57,11 +110,17 @@ echo "Trustabl scanning branch: $BR"
 # ---- resolve version ----
 VER="$VERSION"
 if [ "$VER" = "latest" ]; then
-  VER=$(curl -sSL "${AUTH[@]}" https://api.github.com/repos/trustabl/trustabl/releases/latest | jq -r '.tag_name // empty')
+  VER=$(curl_gh -fsSL https://api.github.com/repos/trustabl/trustabl/releases/latest | jq -r '.tag_name // empty')
 fi
 if [ -z "$VER" ] || [ "$VER" = "null" ]; then
-  echo "Could not resolve trustabl version. Pin 'VERSION' to a tag, or set GITHUB_TOKEN."
-  exit 1
+  echo "Could not resolve trustabl version. Pin 'VERSION' to a tag, or set GITHUB_TOKEN." >&2
+  exit 2
+fi
+# One release-tag segment. Slashes and '..' are rejected so the download URL
+# cannot be walked out of trustabl/trustabl/releases/download/<tag>/.
+if [[ ! "$VER" =~ ^[A-Za-z0-9._+-]+$ ]] || [[ "$VER" == *..* ]]; then
+  echo "Invalid trustabl version. Pin VERSION to a single release tag (for example v0.1.14)." >&2
+  exit 2
 fi
 echo "Trustabl version: $VER"
 
@@ -70,42 +129,53 @@ VNUM="${VER#v}"
 case "$(uname -s)" in
   Linux)  OS=linux ;;
   Darwin) OS=darwin ;;
-  *) echo "Unsupported OS $(uname -s)"; exit 1 ;;
+  *) echo "Unsupported OS $(uname -s)"; exit 2 ;;
 esac
 case "$(uname -m)" in
   x86_64|amd64)  ARCH=amd64 ;;
   aarch64|arm64) ARCH=arm64 ;;
-  *) echo "Unsupported arch $(uname -m)"; exit 1 ;;
+  *) echo "Unsupported arch $(uname -m)"; exit 2 ;;
 esac
 ASSET="trustabl_${VNUM}_${OS}_${ARCH}.tar.gz"
-DEST="$(pwd)/.trustabl-bin"
-mkdir -p "$DEST"
+# Private directory. A .trustabl-bin symlink or a pre-seeded binary in the
+# workspace must not receive the download or be executed.
+DEST=$(mktemp -d)
+
 # The release download URL (Accept: application/octet-stream) increments the
 # upstream trustabl/trustabl per-asset download_count.
-curl -fSL -H "Accept: application/octet-stream" "${AUTH[@]}" \
+curl_gh -fSL -H "Accept: application/octet-stream" \
   -o "$DEST/$ASSET" \
   "https://github.com/trustabl/trustabl/releases/download/${VER}/${ASSET}"
 
 # ---- verify checksum (sha256 against the release checksums.txt) ----
-if curl -fsSL "${AUTH[@]}" -o "$DEST/checksums.txt" \
-     "https://github.com/trustabl/trustabl/releases/download/${VER}/checksums.txt" 2>/dev/null; then
-  EXPECTED=$(grep " ${ASSET}\$" "$DEST/checksums.txt" | awk '{print $1}' | head -1)
-  if [ -n "$EXPECTED" ]; then
-    ACTUAL=$(sha256sum "$DEST/$ASSET" | awk '{print $1}')
-    if [ "$EXPECTED" != "$ACTUAL" ]; then
-      echo "Checksum mismatch for $ASSET: expected $EXPECTED, got $ACTUAL"
-      exit 1
-    fi
-    echo "checksum verified: $ASSET"
-  else
-    echo "WARNING: $ASSET not listed in checksums.txt — skipping verification"
-  fi
-else
-  echo "WARNING: could not fetch checksums.txt — skipping verification"
+# Missing checksums used to print a warning and continue. That executed whatever
+# bytes came back. A failed check is a setup error (exit 2), not a finding gate.
+if ! curl_gh -fsSL -o "$DEST/checksums.txt" \
+     "https://github.com/trustabl/trustabl/releases/download/${VER}/checksums.txt"; then
+  echo "Could not fetch checksums.txt for ${VER}; refusing to run an unverified binary." >&2
+  exit 2
 fi
+EXPECTED=$(awk -v asset="$ASSET" '$2 == asset { print $1; exit }' "$DEST/checksums.txt")
+ACTUAL=$(sha256sum "$DEST/$ASSET" | awk '{print $1}')
+if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+  echo "Checksum verification failed for ${ASSET}; refusing to run it." >&2
+  exit 2
+fi
+echo "checksum verified: $ASSET"
 
+# Reject archive members that would write outside DEST, then require a regular
+# file named trustabl. Invoke it by path so PATH cannot supply a different one.
+if tar -tzf "$DEST/$ASSET" | awk '/(^|\/)\.\.(\/|$)/ || /^\// { found=1 } END { exit !found }'; then
+  echo "Release archive has unsafe member paths; refusing to extract." >&2
+  exit 2
+fi
 tar -xzf "$DEST/$ASSET" -C "$DEST"
-export PATH="$DEST:$PATH"
+if [ ! -f "$DEST/trustabl" ] || [ -L "$DEST/trustabl" ]; then
+  echo "Release archive did not contain a regular trustabl binary." >&2
+  exit 2
+fi
+chmod +x "$DEST/trustabl"
+TRUSTABL_BIN="$DEST/trustabl"
 
 # ---- scan ----
 set +e
@@ -133,12 +203,22 @@ BASE_ARGS=(scan "$TARGET")
 [ "$STRICT" = "true" ] && BASE_ARGS+=(--strict)
 [ -n "$RULES_REF" ] && BASE_ARGS+=(--rules-ref "$RULES_REF")
 
-# Run 1: SARIF (file emit).
-trustabl "${BASE_ARGS[@]}" --format sarif > "$SARIF_FILE"
-NATIVE_CODE=$?
+# Run 1: SARIF (file emit). stage_output replaces a symlink instead of following it.
+"$TRUSTABL_BIN" "${BASE_ARGS[@]}" --format sarif | stage_output "$SARIF_FILE"
+sarif_status=("${PIPESTATUS[@]}")
+NATIVE_CODE=${sarif_status[0]}
+if [ "${sarif_status[1]}" -ne 0 ]; then
+  echo "Could not write ${SARIF_FILE}." >&2
+  exit 2
+fi
 
 # Run 2: JSON (drives thresholds, log summary, dotenv).
-trustabl "${BASE_ARGS[@]}" --format json > "$JSON_FILE" || true
+"$TRUSTABL_BIN" "${BASE_ARGS[@]}" --format json | stage_output "$JSON_FILE"
+json_status=("${PIPESTATUS[@]}")
+if [ "${json_status[1]}" -ne 0 ]; then
+  echo "Could not write ${JSON_FILE}." >&2
+  exit 2
+fi
 SCAN_END=$(date -u +%Y-%m-%dT%H:%M:%S)
 
 # trustabl's overall_score is a float in [0.0, 1.0]; scale to [0,100] ints.
@@ -163,7 +243,7 @@ MAX_SEV=$(jq -r '
   echo "TRUSTABL_RISK_SCORE=$RISK"
   echo "TRUSTABL_MAX_SEVERITY=$MAX_SEV"
   echo "TRUSTABL_FINDINGS_COUNT=$COUNT"
-} > trustabl.env
+} | stage_output trustabl.env
 
 # ── Projected readiness (estimate — re-applies trustabl's own scoring) ──
 # Per-tool score = max(0, 1 - weighted/3); overall = min over tools;
@@ -258,7 +338,11 @@ fi
 GREEN=$'\e[1;32m'; RED=$'\e[1;31m'; RESET=$'\e[0m'
 # No native step-summary UI on AWS; write the markdown to an artifact instead.
 SUMMARY="trustabl-summary.md"
-: > "$SUMMARY"
+if [ "$FAIL" = "1" ]; then
+  SUMMARY_ENDING="### ❌ Failed — ${REASONS[*]}"
+else
+  SUMMARY_ENDING="### ✅ Successfully passed scanning"
+fi
 {
   echo "## Trustabl scan"
   echo ""
@@ -286,14 +370,13 @@ SUMMARY="trustabl-summary.md"
   echo "| Max severity | \`$MAX_SEV\` |"
   echo "| Native exit | \`$NATIVE_CODE\` |"
   echo ""
-} >> "$SUMMARY"
+  echo "$SUMMARY_ENDING"
+} | stage_output "$SUMMARY"
 
 if [ "$FAIL" = "1" ]; then
   printf '%b\n' "${RED}✗ Failed due to: ${REASONS[*]}${RESET}"
-  echo "### ❌ Failed — ${REASONS[*]}" >> "$SUMMARY"
   exit 1
 fi
 
 printf '%b\n' "${GREEN}✓ Successfully passed scanning${RESET}"
-echo "### ✅ Successfully passed scanning" >> "$SUMMARY"
 exit 0
